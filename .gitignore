@@ -1,0 +1,15 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Data & generated stuff
+data/
+outputs/
+figs/
+*.csv
+*.png
+*.ipynb_checkpoints/
+
+# macOS
+.DS_Store
