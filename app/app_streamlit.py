@@ -1,221 +1,244 @@
-import streamlit as st
-import pandas as pd
+# app/app_streamlit.py
+import io
 import numpy as np
+import pandas as pd
+import streamlit as st
 
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, f1_score, classification_report
-from sklearn.inspection import permutation_importance
-
-from fairlearn.metrics import (
-    MetricFrame,
-    selection_rate,
-    demographic_parity_difference,
-    demographic_parity_ratio,
-    true_positive_rate,
-    false_positive_rate,
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, f1_score, classification_report
 )
 
-import altair as alt
+from fairlearn.metrics import MetricFrame
 
-st.set_page_config(page_title="FairHire Analytics — Prototype", layout="wide")
+# ---------- Helpers ----------
 
-st.title("FairHire Analytics — Bias Detection Prototype")
+def infer_column_types(df: pd.DataFrame):
+    """Return (categorical_cols, numeric_cols) by dtype heuristics."""
+    cat = df.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+    num = df.select_dtypes(include=[np.number]).columns.tolist()
+    return cat, num
 
+def build_pipeline(categorical_cols, numeric_cols):
+    """Build a simple, portable preprocessing + LR pipeline."""
+    ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+    preprocess = ColumnTransformer(
+        transformers=[
+            ("cat", ohe, categorical_cols),
+            ("num", StandardScaler(with_mean=False), numeric_cols),
+        ],
+        remainder="drop",
+    )
+    clf = LogisticRegression(
+        max_iter=1000, class_weight="balanced", solver="lbfgs", n_jobs=None
+    )
+    return Pipeline([("prep", preprocess), ("model", clf)])
+
+def as_str_array(x):
+    """Flatten and coerce to string array (avoids dtype surprises)."""
+    return np.array(x).astype(str).ravel()
+
+def safe_selection_rate(y_true, y_pred, pos_label):
+    y_pred = as_str_array(y_pred)
+    mask = (y_pred == str(pos_label))
+    if mask.size == 0:
+        return 0.0
+    return float(np.mean(mask))
+
+def safe_tpr(y_true, y_pred, pos_label):
+    yt = as_str_array(y_true)
+    yp = as_str_array(y_pred)
+    pos = (yt == str(pos_label))
+    if pos.sum() == 0:
+        return 0.0
+    return float(((pos) & (yp == str(pos_label))).sum() / pos.sum())
+
+def safe_fpr(y_true, y_pred, pos_label):
+    yt = as_str_array(y_true)
+    yp = as_str_array(y_pred)
+    neg = (yt != str(pos_label))
+    if neg.sum() == 0:
+        return 0.0
+    return float(((neg) & (yp == str(pos_label))).sum() / neg.sum())
+
+def _alt_selection_bars(series: pd.Series, title: str):
+    import altair as alt
+    dfp = series.reset_index()
+    dfp.columns = ["group", "selection_rate"]
+    dfp["selection_rate_pct"] = (100 * dfp["selection_rate"]).round(2)
+    bars = alt.Chart(dfp).mark_bar().encode(
+        x=alt.X("group:N", title="Group"),
+        y=alt.Y("selection_rate_pct:Q", title="Selection Rate (%)"),
+        tooltip=["group", "selection_rate_pct"]
+    ).properties(title=title, height=240)
+    labels = bars.mark_text(dy=-6).encode(text="selection_rate_pct:Q")
+    return bars + labels
+
+# ---------- Page config ----------
+st.set_page_config(page_title="FairHire Analytics — Bias Detection", layout="wide")
+st.title("FairHire Analytics — Bias Detection")
+st.caption(
+    "Upload any CSV with a **binary** target (e.g., `hired` yes/no) and pick a **sensitive attribute** "
+    "(e.g., `sex`, `race`). The app trains a simple baseline model (which does **not** use the sensitive "
+    "attribute) and reports performance plus fairness KPIs."
+)
+
+# ---------- Sidebar: controls ----------
+with st.sidebar:
+    st.header("Settings")
+    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    st.caption("Include a binary outcome column and at least one demographic column (e.g., sex, race).")
+
+    val_split = st.slider("Validation split", 0.10, 0.40, 0.20, step=0.01)
+    seed = st.number_input("Random seed", value=42, step=1)
+
+# ---------- Body: Upload & Preview ----------
+st.subheader("Upload & Preview")
 st.markdown(
-"""
-Upload any **CSV** with a binary target (e.g. `hired` = yes/no) and pick a **sensitive attribute**
-(e.g. `sex`, `race`). The app trains a simple baseline model and reports performance + fairness KPIs.
-"""
+    "- **What this does:** reads your CSV and shows the first few rows so you can confirm columns and values.\n"
+    "- **What to check:** your target has only two values (binary), and your sensitive column has meaningful groups."
 )
 
-# --------- 1) Data upload ----------
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
 if uploaded is None:
-    st.info("Upload a CSV to begin. Include a binary target column, and at least one candidate sensitive column.")
+    st.info("Upload a CSV to begin.")
     st.stop()
 
+# Read CSV
 try:
     df = pd.read_csv(uploaded)
 except Exception as e:
-    st.error(f"Could not read CSV: {e}")
+    st.error(f"Failed to read CSV: {e}")
     st.stop()
 
-if df.empty or df.shape[1] < 2:
-    st.error("CSV looks empty or has too few columns.")
+if df.empty or len(df) < 20:
+    st.error("CSV is empty or too small. Provide at least ~20 rows.")
     st.stop()
 
-st.subheader("Preview")
-st.dataframe(df.head())
+st.dataframe(df.head(), use_container_width=True)
 
-# --------- 2) Column selection ----------
-with st.sidebar:
-    st.header("Settings")
+# Choose target + positive label + sensitive column
+all_cols = df.columns.tolist()
+with st.expander("Configuration", expanded=True):
+    st.markdown(
+        "**Explain:** Choose the label column, which value counts as the **positive** outcome, "
+        "and the sensitive attribute for fairness breakdowns. The sensitive attribute is **not** used by the model."
+    )
+    target_col = st.selectbox("Target (label) column", options=all_cols, index=0)
+    pos_choices = sorted(df[target_col].astype(str).unique().tolist())
+    pos_label = st.selectbox("Positive label (the 'favorable' outcome)", options=pos_choices, index=0)
 
-    target_col = st.selectbox("Target (label) column", options=df.columns.tolist())
-    candidates = [c for c in df.columns if c != target_col]
-    if not candidates:
-        st.error("No columns left after selecting the target.")
-        st.stop()
+    sens_col = st.selectbox(
+        "Sensitive attribute (for fairness)", options=[c for c in all_cols if c != target_col]
+    )
 
-    sensitive_col = st.selectbox("Sensitive attribute", options=candidates)
+# Basic cleaning/coercion
+df_work = df.copy()
+df_work[target_col] = df_work[target_col].astype(str).str.strip()
+df_work[sens_col] = df_work[sens_col].astype(str).str.strip()
 
-    # Positive class selection
-    # We infer classes from the column values
-    classes = df[target_col].dropna().unique().tolist()
-    if len(classes) < 2:
-        st.error("Target must have at least two distinct values.")
-        st.stop()
-
-    # default to the 'positive-looking' class if present
-    default_pos = ">50K" if ">50K" in classes else ("yes" if "yes" in [str(x).lower() for x in classes] else classes[0])
-    pos_label = st.selectbox("Positive label (the 'favorable' outcome)", options=classes, index=classes.index(default_pos) if default_pos in classes else 0)
-
-    test_size = st.slider("Validation split", 0.1, 0.4, 0.2, 0.05)
-    random_state = st.number_input("Random seed", min_value=0, value=42, step=1)
-
-# --------- 3) Basic cleaning ----------
-df = df.dropna().copy()
-
-# Ensure target is string labels
-df[target_col] = df[target_col].astype(str).str.strip()
+# Separate features/label
+X_full = df_work.drop(columns=[target_col])
+y_full = df_work[target_col]
 
 # Split
-X = df.drop(columns=[target_col])
-y = df[target_col]
+X_train_full, X_valid_full, y_train, y_valid = train_test_split(
+    X_full, y_full, test_size=val_split, random_state=int(seed), stratify=y_full if y_full.nunique() == 2 else None
+)
 
-try:
-    X_train, X_valid, y_train, y_valid = train_test_split(
-        X, y, test_size=test_size, stratify=y, random_state=random_state
-    )
-except ValueError:
-    # Fallback if stratify fails (e.g., extreme class imbalance)
-    X_train, X_valid, y_train, y_valid = train_test_split(
-        X, y, test_size=test_size, random_state=random_state
-    )
+# Capture sensitive column for fairness (from the FULL matrices)
+sens_valid = X_valid_full[sens_col].copy()
 
-# Column types
-categorical_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()
-numeric_cols = X.select_dtypes(exclude=["object", "category"]).columns.tolist()
+# Remove sensitive column from features for modeling
+X_train = X_train_full.drop(columns=[sens_col], errors="ignore")
+X_valid = X_valid_full.drop(columns=[sens_col], errors="ignore")
 
-# --------- 4) Pipeline (no pickles) ----------
-ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=True)
-preprocess = ColumnTransformer([
-    ("cat", ohe, categorical_cols),
-    ("num", "passthrough", numeric_cols)
-])
-
-clf = LogisticRegression(max_iter=1000, class_weight="balanced", solver="lbfgs")
-
-pipe = Pipeline([
-    ("prep", preprocess),
-    ("model", clf)
-])
-
-pipe.fit(X_train, y_train)
-y_pred = pipe.predict(X_valid)
-
-# --------- 5) Performance ----------
-acc = accuracy_score(y_valid, y_pred)
-f1  = f1_score(y_valid, y_pred, pos_label=pos_label)
-
-st.subheader("Performance")
-c1, c2 = st.columns(2)
-with c1:
-    st.metric("Accuracy", f"{acc:.3f}")
-with c2:
-    st.metric(f"F1 ({pos_label})", f"{f1:.3f}")
-
-with st.expander("Classification report"):
-    st.text(classification_report(y_valid, y_pred))
-
-# --------- 6) Fairness (Demographic Parity) ----------
-if sensitive_col not in X_valid.columns:
-    st.error(f"Sensitive column '{sensitive_col}' not found in features.")
+# Infer column types on TRAIN
+cat_cols, num_cols = infer_column_types(X_train)
+if len(cat_cols) + len(num_cols) == 0:
+    st.error("No usable feature columns after removing target and sensitive column.")
     st.stop()
 
-# Selection rates by group
-mf = MetricFrame(
-    metrics={"selection_rate": selection_rate},
-    y_true=y_valid,
-    y_pred=y_pred,
-    sensitive_features=X_valid[sensitive_col]
-)
-dp_diff = demographic_parity_difference(
-    y_valid, y_pred, sensitive_features=X_valid[sensitive_col]
-)
-dp_ratio = demographic_parity_ratio(
-    y_valid, y_pred, sensitive_features=X_valid[sensitive_col]
-)
+# Build & train
+pipe = build_pipeline(cat_cols, num_cols)
+pipe.fit(X_train, y_train)
 
-st.subheader("Fairness — Demographic Parity")
-c3, c4 = st.columns(2)
-with c3:
-    st.metric("DP Difference (↓ better)", f"{dp_diff:.4f}")
-with c4:
-    st.metric("DP Ratio (→ 1.0 better)", f"{dp_ratio:.4f}")
+# Predict
+y_pred = pipe.predict(X_valid)
 
-st.caption("DP Difference = max(group selection) − min(group selection). DP Ratio = min/max selection rate across groups.")
-
-st.write("**Selection rate (by group)**")
-by_group = mf.by_group.reset_index().rename(columns={"index": "group"})
-by_group["selection_rate_pct"] = (by_group["selection_rate"] * 100).round(2)
-
-bar = alt.Chart(by_group).mark_bar().encode(
-    x=alt.X("group:N", title="Group"),
-    y=alt.Y("selection_rate_pct:Q", title="Selection Rate (%)"),
-    tooltip=list(by_group.columns)
-).properties(height=260)
-
-labels = bar.mark_text(dy=-6).encode(text="selection_rate_pct:Q")
-st.altair_chart(bar + labels, use_container_width=True)
-
-# --------- 7) Error by group (helpful KPI) ----------
-err = (y_valid != y_pred).astype(int)
-err_mf = MetricFrame(
-    metrics={"error_rate": lambda yt, yp: np.mean(np.array(yt) != np.array(yp))},
-    y_true=y_valid,
-    y_pred=y_pred,
-    sensitive_features=X_valid[sensitive_col]
+# ---------- Performance ----------
+st.subheader("Performance")
+st.markdown(
+    "- **What this shows:** overall accuracy and F1 for the positive label you chose.\n"
+    "- **How to read it:** accuracy is the share of correct predictions; F1 balances precision & recall for the positive class."
 )
 
-st.write("**Error rate (by group)**")
-st.dataframe(err_mf.by_group.to_frame().rename(columns={0: "error_rate"}))
+acc = accuracy_score(y_valid.astype(str), y_pred.astype(str))
+f1 = f1_score(y_valid.astype(str), y_pred.astype(str), pos_label=str(pos_label))
 
-# --------- 8) Feature importance (optional, model-agnostic) ----------
-st.subheader("Feature influence (Permutation Importance)")
-try:
-    # Use balanced_accuracy which is robust for imbalanced labels
-    perm = permutation_importance(
-        pipe, X_valid, y_valid, n_repeats=5, random_state=42, scoring="balanced_accuracy"
+c1, c2 = st.columns(2)
+c1.metric("Accuracy", f"{acc:.3f}")
+c2.metric(f"F1 ({pos_label})", f"{f1:.3f}")
+
+with st.expander("Classification report", expanded=False):
+    report = classification_report(
+        y_valid.astype(str), y_pred.astype(str), target_names=[str(x) for x in sorted(y_valid.astype(str).unique())]
     )
-    # Get feature names from the ColumnTransformer
-    prep = pipe.named_steps["prep"]
-    ohe_names = []
-    if "cat" in prep.named_transformers_:
-        ohe = prep.named_transformers_["cat"]
-        try:
-            ohe_names = ohe.get_feature_names_out(categorical_cols).tolist()
-        except Exception:
-            ohe_names = []
-    feature_names = ohe_names + numeric_cols
-    # Align lengths safely
-    k = min(len(feature_names), len(perm.importances_mean))
-    feat_df = pd.DataFrame({
-        "feature": feature_names[:k],
-        "importance": perm.importances_mean[:k]
-    }).sort_values("importance", ascending=False).head(15)
+    st.code(report)
 
-    imp_chart = alt.Chart(feat_df).mark_bar().encode(
-        x=alt.X("importance:Q", title="Mean importance (perm.)"),
-        y=alt.Y("feature:N", sort="-x", title="Feature"),
-        tooltip=["feature", alt.Tooltip("importance:Q", format=".4f")]
-    ).properties(height=400)
-    st.altair_chart(imp_chart, use_container_width=True)
-except Exception as e:
-    st.info(f"Permutation importance not shown (reason: {e})")
+# ---------- Fairness ----------
+st.subheader("Fairness")
+st.markdown(
+    "- **What this measures:** differences in outcomes across sensitive groups (e.g., Male/Female).\n"
+    "- **Selection rate:** how often the model predicts the **positive** outcome per group.\n"
+    "- **TPR / FPR:** true-positive and false-positive rates by group. Ideally, similar across groups."
+)
 
-st.success("Done. You can now export screenshots for your report.")
+# Flatten and coerce everything to strings
+y_true = as_str_array(y_valid)
+y_pred_arr = as_str_array(y_pred)
+sens_arr = as_str_array(sens_valid)
+
+# Sanity: aligned lengths
+if not (len(y_true) == len(y_pred_arr) == len(sens_arr)):
+    st.error(f"Length mismatch: y_true={len(y_true)}, y_pred={len(y_pred_arr)}, sens={len(sens_arr)}")
+    st.stop()
+
+# Safe callables that close over pos_label
+sel_rate_fn = lambda yt, yp: safe_selection_rate(yt, yp, pos_label)
+tpr_fn = lambda yt, yp: safe_tpr(yt, yp, pos_label)
+fpr_fn = lambda yt, yp: safe_fpr(yt, yp, pos_label)
+
+# MetricFrame on strings (robust to dtype issues)
+mf = MetricFrame(
+    metrics={"selection_rate": sel_rate_fn, "TPR": tpr_fn, "FPR": fpr_fn},
+    y_true=y_true,
+    y_pred=y_pred_arr,
+    sensitive_features=sens_arr
+)
+
+# Summaries
+group_tbl = mf.by_group.round(3)
+group_rates = mf.by_group["selection_rate"]
+dp_diff = float(abs(group_rates.max() - group_rates.min()))
+dp_ratio = float(group_rates.min() / group_rates.max()) if group_rates.max() > 0 else float("nan")
+
+st.write("**Group metrics**")
+st.dataframe(group_tbl, use_container_width=True)
+st.markdown(
+    f"- **Demographic Parity Difference:** `{dp_diff:.4f}` (↓ better) — absolute gap between highest & lowest selection rate.\n"
+    f"- **Demographic Parity Ratio:** `{dp_ratio:.4f}` (→ 1 is better) — lowest / highest selection rate."
+)
+
+st.altair_chart(
+    _alt_selection_bars(group_rates, f"Selection Rate by {sens_col}"),
+    use_container_width=True
+)
+
+st.caption(
+    "The model never uses the sensitive attribute as an input. "
+    "Fairness is assessed by comparing outcome rates across groups of the sensitive attribute."
+)
